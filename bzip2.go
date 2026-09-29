@@ -37,7 +37,6 @@ type reader struct {
 	c            [256]uint // the ``C'' array for the inverse BWT.
 	tt           []uint32  // mirrors the ``tt'' array in the bzip2 source and contains the P array in the upper 24 bits.
 	tPos         uint32    // Index of the next output byte in tt.
-	pairs        []uint32  // pairs[i] is tt[tt[i]>>8], for walking tt two bytes at a time.
 
 	// The Huffman trees of the current block. They are rebuilt in place for
 	// each block, rather than allocated, so that a stream of many tiny blocks
@@ -46,11 +45,9 @@ type reader struct {
 
 	preRLE      []uint32 // contains the RLE data still to be processed.
 	preRLEUsed  int      // number of entries of preRLE used.
-	walked      []byte   // bytes of preRLE, in order, not yet RLE decoded.
-	walkBuf     [4096]byte
-	lastByte    int  // the last byte value seen.
-	byteRepeats uint // the number of repeats of lastByte seen.
-	repeats     uint // the number of copies of lastByte to output.
+	lastByte    int      // the last byte value seen.
+	byteRepeats uint     // the number of repeats of lastByte seen.
+	repeats     uint     // the number of copies of lastByte to output.
 }
 
 // NewReader returns an [io.Reader] which decompresses bzip2 data from r.
@@ -133,7 +130,9 @@ func (bz2 *reader) readFromBlock(buf []byte) int {
 	// maximum expansion. Thus we process blocks all at once, except for
 	// the RLE which we decompress as required.
 	n := 0
-	for n < len(buf) {
+	for (bz2.repeats > 0 || bz2.preRLEUsed < len(bz2.preRLE)) && n < len(buf) {
+		// We have RLE data pending.
+
 		// The run-length encoding works like this:
 		// Any sequence of four equal bytes is followed by a length
 		// byte which contains the number of repeats of that byte to
@@ -142,72 +141,38 @@ func (bz2 *reader) readFromBlock(buf []byte) int {
 		// object.
 
 		if bz2.repeats > 0 {
-			run := buf[n:min(len(buf), n+int(bz2.repeats))]
-			for i := range run {
-				run[i] = byte(bz2.lastByte)
-			}
-			n += len(run)
-			bz2.repeats -= uint(len(run))
+			buf[n] = byte(bz2.lastByte)
+			n++
+			bz2.repeats--
 			if bz2.repeats == 0 {
 				bz2.lastByte = -1
 			}
 			continue
 		}
 
-		if len(bz2.walked) == 0 {
-			if bz2.preRLEUsed == len(bz2.preRLE) {
-				break
-			}
-			bz2.walk()
+		bz2.tPos = bz2.preRLE[bz2.tPos]
+		b := byte(bz2.tPos)
+		bz2.tPos >>= 8
+		bz2.preRLEUsed++
+
+		if bz2.byteRepeats == 3 {
+			bz2.repeats = uint(b)
+			bz2.byteRepeats = 0
+			continue
 		}
 
-		walked, lastByte, byteRepeats := bz2.walked, bz2.lastByte, bz2.byteRepeats
-		i := 0
-		for i < len(walked) && n < len(buf) {
-			b := walked[i]
-			i++
-
-			if byteRepeats == 3 {
-				bz2.repeats = uint(b)
-				byteRepeats = 0
-				break
-			}
-
-			if lastByte == int(b) {
-				byteRepeats++
-			} else {
-				byteRepeats = 0
-			}
-			lastByte = int(b)
-
-			buf[n] = b
-			n++
+		if bz2.lastByte == int(b) {
+			bz2.byteRepeats++
+		} else {
+			bz2.byteRepeats = 0
 		}
-		bz2.walked, bz2.lastByte, bz2.byteRepeats = walked[i:], lastByte, byteRepeats
+		bz2.lastByte = int(b)
+
+		buf[n] = b
+		n++
 	}
 
 	return n
-}
-
-// walk follows the inverse BWT to the next bytes of the block.
-func (bz2 *reader) walk() {
-	tt, pairs, tPos := bz2.preRLE, bz2.pairs, bz2.tPos
-	walked := bz2.walkBuf[:min(len(bz2.walkBuf), len(tt)-bz2.preRLEUsed)]
-	i := 0
-	for ; i+1 < len(walked); i += 2 {
-		p := pairs[tPos]
-		walked[i] = byte(tt[tPos])
-		walked[i+1] = byte(p)
-		tPos = p >> 8
-	}
-	if i < len(walked) {
-		t := tt[tPos]
-		walked[i] = byte(t)
-		tPos = t >> 8
-	}
-	bz2.tPos = tPos
-	bz2.preRLEUsed += len(walked)
-	bz2.walked = walked
 }
 
 func (bz2 *reader) read(buf []byte) (int, error) {
@@ -485,14 +450,6 @@ func (bz2 *reader) readBlock() (err error) {
 	bz2.preRLE = bz2.tt[:bufIndex]
 	bz2.preRLEUsed = 0
 	bz2.tPos = inverseBWT(bz2.preRLE, origPtr, bz2.c[:])
-	if len(bz2.pairs) < bufIndex {
-		// Grow geometrically, up to the block size, rather than to fit
-		// each block, so that a stream whose blocks keep growing can't
-		// make the decoder reallocate for every block.
-		n := min(max(bufIndex, 2*len(bz2.pairs)), bz2.blockSize)
-		bz2.pairs = make([]uint32, n)
-	}
-	pairUp(bz2.preRLE, bz2.pairs)
 	bz2.lastByte = -1
 	bz2.byteRepeats = 0
 	bz2.repeats = 0
@@ -524,16 +481,6 @@ func inverseBWT(tt []uint32, origPtr uint, c []uint) uint32 {
 	}
 
 	return tt[origPtr] >> 8
-}
-
-// pairUp fills pairs for tt. Walking tt is a chain of dependent loads,
-// bound by memory latency. Walking pairs gives two bytes per load, and the
-// loads here are independent.
-func pairUp(tt, pairs []uint32) {
-	pairs = pairs[:len(tt)]
-	for i, t := range tt {
-		pairs[i] = tt[t>>8]
-	}
 }
 
 // This is a standard CRC32 like in hash/crc32 except that all the shifts are reversed,
